@@ -1,417 +1,297 @@
 """
-Hacker Hub - Web Version
-Fixed for Vercel Deployment
+Hacker Hub - Complete Web Application
+Production-ready with all console features
 """
 
 import os
 import json
 from datetime import datetime
 from functools import wraps
-from flask import Flask, render_template, jsonify, request, session, redirect, url_for, send_from_directory
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user
+from flask_bcrypt import Bcrypt
 from flask_cors import CORS
+from flask_migrate import Migrate
+from flask_mail import Mail
+from config import Config
+from database import db, User, Tool, UserTool, Post, Comment, CTFChallenge
 
-# ==================== FLASK CONFIGURATION ====================
-# Get absolute paths for Vercel compatibility
-current_dir = os.path.dirname(os.path.abspath(__file__))
+# Initialize extensions
+login_manager = LoginManager()
+bcrypt = Bcrypt()
+mail = Mail()
+migrate = Migrate()
 
-app = Flask(
-    __name__,
-    static_folder=os.path.join(current_dir, 'static'),
-    template_folder=os.path.join(current_dir, 'templates'),
-    static_url_path='/static'
-)
-
-app.secret_key = os.environ.get('SESSION_SECRET', 'dev-secret-key-change-in-production')
-app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False  # Disable pretty JSON in production
-CORS(app)
-
-# ==================== STATIC FILE HANDLING ====================
-@app.route('/static/<path:path>')
-def serve_static(path):
-    """Serve static files directly"""
-    try:
-        return send_from_directory('static', path)
-    except:
-        return "", 404
-
-@app.after_request
-def add_header(response):
-    """Add cache headers for static files"""
-    if request.path.startswith('/static/'):
-        response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
-    return response
-
-# ==================== DATABASE SIMULATION ====================
-USERS_DB = {}
-TOOLS_DB = {}
-
-def load_tools():
-    """Load tools from JSON file"""
-    try:
-        tools_path = os.path.join(current_dir, 'tools.json')
-        if os.path.exists(tools_path):
-            with open(tools_path, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"Error loading tools: {e}")
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
     
-    # Fallback to default tools
-    return initialize_default_tools()
-
-def initialize_default_tools():
-    """Initialize with default tools data"""
-    return {
-        "linux": {
-            "kali": {
-                "information_gathering": [
-                    {"name": "Nmap", "desc": "Network discovery tool", "difficulty": "beginner", "command": "nmap -sV [target]"},
-                    {"name": "theHarvester", "desc": "Email/subdomain enumeration", "difficulty": "beginner", "command": "theHarvester -d [domain] -b all"}
-                ],
-                "vulnerability_analysis": [
-                    {"name": "OpenVAS", "desc": "Vulnerability scanner", "difficulty": "intermediate", "command": "gvm-start"},
-                    {"name": "Nikto", "desc": "Web server scanner", "difficulty": "beginner", "command": "nikto -h [url]"}
-                ]
-            },
-            "ubuntu": {
-                "container_security": [
-                    {"name": "Docker Bench", "desc": "Docker security audit", "difficulty": "intermediate", "command": "git clone https://github.com/docker/docker-bench-security.git"}
-                ]
-            },
-            "termux": {
-                "mobile_hacking": [
-                    {"name": "Termux-API", "desc": "Access phone features", "difficulty": "beginner", "command": "pkg install termux-api"}
-                ]
-            }
-        },
-        "windows": {
-            "general": {
-                "reverse_engineering": [
-                    {"name": "IDA Pro", "desc": "Interactive disassembler", "difficulty": "advanced", "command": ""},
-                    {"name": "x64dbg", "desc": "Open-source debugger", "difficulty": "intermediate", "command": ""}
-                ]
-            }
-        },
-        "web": {
-            "general": {
-                "bug_bounty": [
-                    {"name": "Burp Suite", "desc": "Web vulnerability scanner", "difficulty": "intermediate", "command": ""}
-                ]
-            }
+    # Initialize extensions with app
+    db.init_app(app)
+    login_manager.init_app(app)
+    bcrypt.init_app(app)
+    mail.init_app(app)
+    migrate.init_app(app, db)
+    CORS(app)
+    
+    # Configure login manager
+    login_manager.login_view = 'auth.login'
+    login_manager.login_message = 'Please log in to access this page.'
+    login_manager.login_message_category = 'info'
+    
+    @login_manager.user_loader
+    def load_user(user_id):
+        return User.query.get(int(user_id))
+    
+    # Import blueprints
+    from auth import auth_bp
+    from tools import tools_bp
+    from community import community_bp
+    
+    # Register blueprints
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(tools_bp)
+    app.register_blueprint(community_bp)
+    
+    # ==================== CORE ROUTES ====================
+    
+    @app.route('/')
+    def index():
+        """Landing page"""
+        if current_user.is_authenticated:
+            return redirect(url_for('dashboard'))
+        return render_template('index.html')
+    
+    @app.route('/dashboard')
+    @login_required
+    def dashboard():
+        """Main dashboard"""
+        user = current_user
+        
+        # Get user stats
+        stats = {
+            'followed_tools': len(user.followed_tools),
+            'posts': len(user.posts),
+            'comments': len(user.comments)
         }
-    }
-
-def save_tools():
-    """Save tools to JSON file"""
-    try:
-        tools_path = os.path.join(current_dir, 'tools.json')
-        with open(tools_path, 'w') as f:
-            json.dump(TOOLS_DB, f, indent=2)
-    except Exception as e:
-        print(f"Error saving tools: {e}")
-
-# Initialize tools
-TOOLS_DB = load_tools()
-
-# ==================== ROUTES ====================
-@app.route('/')
-def index():
-    """Landing page"""
-    return render_template('index.html')
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    """User registration"""
-    if request.method == 'POST':
-        try:
-            data = request.get_json()
-            if not data:
-                return jsonify({'error': 'No data provided'}), 400
-                
-            username = data.get('username')
-            email = data.get('email')
-            experience = data.get('experience', 'beginner')
-            
-            if not username or not email:
-                return jsonify({'error': 'Username and email required'}), 400
-            
-            if username in USERS_DB:
-                return jsonify({'error': 'Username already exists'}), 400
-            
-            user = {
-                'id': len(USERS_DB) + 1,
-                'username': username,
-                'email': email,
-                'experience': experience,
-                'resources': [],
-                'followed_tools': [],
-                'joined_date': datetime.now().isoformat(),
-                'anonymous': False
-            }
-            
-            USERS_DB[username] = user
-            session['user'] = username
-            
-            return jsonify({
-                'success': True,
-                'user': user,
-                'message': 'Account created successfully'
-            })
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    # GET request - render signup page
-    return render_template('signup.html')
-
-@app.route('/login', methods=['POST'])
-def login():
-    """User login"""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-            
-        username = data.get('username')
         
-        if not username:
-            return jsonify({'error': 'Username required'}), 400
+        # Get recent tools
+        recent_tools = Tool.query.order_by(Tool.created_at.desc()).limit(5).all()
         
-        # Simplified auth for demo
-        if username in USERS_DB:
-            session['user'] = username
-            return jsonify({
-                'success': True,
-                'user': USERS_DB[username]
-            })
+        # Get recommended tools based on experience
+        if user.experience == 'beginner':
+            recommended = Tool.query.filter_by(difficulty='beginner').limit(3).all()
+        elif user.experience == 'intermediate':
+            recommended = Tool.query.filter(Tool.difficulty.in_(['beginner', 'intermediate'])).limit(3).all()
         else:
-            # Auto-create user for demo
-            user = {
-                'id': len(USERS_DB) + 1,
-                'username': username,
-                'experience': 'beginner',
-                'resources': [],
-                'followed_tools': [],
-                'joined_date': datetime.now().isoformat(),
-                'anonymous': False
-            }
-            USERS_DB[username] = user
-            session['user'] = username
-            
-            return jsonify({
-                'success': True,
-                'user': user,
-                'message': 'Auto-created account for demo'
-            })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/anonymous')
-def anonymous():
-    """Anonymous access"""
-    session['user'] = 'anonymous_' + str(hash(datetime.now()))[:8]
-    session['anonymous'] = True
-    return redirect('/dashboard')
-
-@app.route('/dashboard')
-def dashboard():
-    """Main dashboard"""
-    if 'user' not in session:
-        return redirect('/')
+            recommended = Tool.query.limit(3).all()
+        
+        return render_template('dashboard.html', 
+                             user=user, 
+                             stats=stats,
+                             recent_tools=recent_tools,
+                             recommended_tools=recommended)
     
-    user_data = USERS_DB.get(session['user'], {
-        'username': session['user'],
-        'anonymous': session.get('anonymous', False),
-        'experience': 'beginner',
-        'resources': [],
-        'followed_tools': []
-    })
+    @app.route('/experience', methods=['GET', 'POST'])
+    @login_required
+    def experience():
+        """Set experience level"""
+        if request.method == 'POST':
+            experience_level = request.form.get('experience')
+            if experience_level in ['beginner', 'intermediate', 'advanced', 'elite']:
+                current_user.experience = experience_level
+                db.session.commit()
+                flash('Experience level updated!', 'success')
+                return redirect(url_for('resources'))
+        
+        return render_template('experience.html')
     
-    return render_template('dashboard.html', user=user_data)
-
-@app.route('/api/tools')
-def get_tools():
-    """API endpoint for tools"""
-    try:
-        platform = request.args.get('platform')
-        category = request.args.get('category')
-        subcategory = request.args.get('subcategory')
+    @app.route('/resources', methods=['GET', 'POST'])
+    @login_required
+    def resources():
+        """Set available resources"""
+        if request.method == 'POST':
+            resources = request.form.getlist('resources')
+            current_user.set_resources(resources)
+            db.session.commit()
+            flash('Resources updated!', 'success')
+            return redirect(url_for('dashboard'))
         
-        if platform:
-            if category:
-                if subcategory:
-                    # Get specific subcategory
-                    tools = TOOLS_DB.get(platform, {}).get(category, {}).get(subcategory, [])
-                    return jsonify(tools)
-                # Get all subcategories in category
-                categories = TOOLS_DB.get(platform, {}).get(category, {})
-                return jsonify(categories)
-            # Get all categories in platform
-            platforms = TOOLS_DB.get(platform, {})
-            return jsonify(platforms)
-        
-        # Get all platforms
-        return jsonify(TOOLS_DB)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/search')
-def search_tools():
-    """Search tools"""
-    try:
-        query = request.args.get('q', '').lower()
-        if not query or len(query) < 2:
-            return jsonify([])
+        return render_template('resources.html')
+    
+    @app.route('/profile', methods=['GET', 'POST'])
+    @login_required
+    def profile():
+        """User profile"""
+        if request.method == 'POST':
+            # Update profile
+            username = request.form.get('username')
+            email = request.form.get('email')
+            bio = request.form.get('bio', '')
             
-        results = []
-        
-        for platform, categories in TOOLS_DB.items():
-            for category, subcategories in categories.items():
-                for subcategory, tools in subcategories.items():
-                    for tool in tools:
-                        if (query in tool['name'].lower() or 
-                            query in tool['desc'].lower() or
-                            query in platform.lower()):
-                            results.append({
-                                **tool,
-                                'platform': platform,
-                                'category': category,
-                                'subcategory': subcategory
-                            })
-        
-        return jsonify(results[:20])  # Limit results
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/user/follow', methods=['POST'])
-def follow_tool():
-    """Follow a tool"""
-    try:
-        if 'user' not in session or session.get('anonymous'):
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
+            # Check if username is taken (excluding current user)
+            if username != current_user.username:
+                existing = User.query.filter_by(username=username).first()
+                if existing:
+                    flash('Username already taken!', 'danger')
+                    return redirect(url_for('profile'))
             
-        tool_name = data.get('tool')
-        if not tool_name:
-            return jsonify({'error': 'Tool name required'}), 400
+            current_user.username = username
+            current_user.email = email
+            db.session.commit()
+            flash('Profile updated!', 'success')
+            return redirect(url_for('profile'))
         
-        user = USERS_DB.get(session['user'])
-        if user and tool_name not in user['followed_tools']:
-            user['followed_tools'].append(tool_name)
+        return render_template('profile.html', user=current_user)
+    
+    @app.route('/search')
+    def search():
+        """Search across tools, posts, and users"""
+        query = request.args.get('q', '')
+        results = {
+            'tools': [],
+            'posts': [],
+            'users': []
+        }
         
-        return jsonify({'success': True, 'tool': tool_name})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/user/unfollow', methods=['POST'])
-def unfollow_tool():
-    """Unfollow a tool"""
-    try:
-        if 'user' not in session or session.get('anonymous'):
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
+        if query:
+            # Search tools
+            tools = Tool.query.filter(
+                Tool.name.ilike(f'%{query}%') | 
+                Tool.description.ilike(f'%{query}%') |
+                Tool.category.ilike(f'%{query}%')
+            ).limit(10).all()
+            results['tools'] = tools
             
-        tool_name = data.get('tool')
-        if not tool_name:
-            return jsonify({'error': 'Tool name required'}), 400
+            # Search posts
+            posts = Post.query.filter(
+                Post.title.ilike(f'%{query}%') |
+                Post.content.ilike(f'%{query}%')
+            ).limit(10).all()
+            results['posts'] = posts
+            
+            # Search users
+            users = User.query.filter(User.username.ilike(f'%{query}%')).limit(10).all()
+            results['users'] = users
         
-        user = USERS_DB.get(session['user'])
-        if user and tool_name in user['followed_tools']:
-            user['followed_tools'].remove(tool_name)
+        return render_template('search.html', query=query, results=results)
+    
+    @app.route('/api/health')
+    def health():
+        """Health check endpoint"""
+        return jsonify({
+            'status': 'healthy',
+            'timestamp': datetime.utcnow().isoformat(),
+            'users': User.query.count(),
+            'tools': Tool.query.count(),
+            'posts': Post.query.count()
+        })
+    
+    # ==================== ERROR HANDLERS ====================
+    
+    @app.errorhandler(404)
+    def not_found(error):
+        return render_template('404.html'), 404
+    
+    @app.errorhandler(500)
+    def server_error(error):
+        return render_template('500.html'), 500
+    
+    # ==================== CONTEXT PROCESSORS ====================
+    
+    @app.context_processor
+    def inject_user():
+        """Inject current user into all templates"""
+        return dict(current_user=current_user)
+    
+    @app.context_processor
+    def inject_tools_categories():
+        """Inject tool categories for navigation"""
+        categories = {}
+        if Tool.query.first():  # Only if database has tools
+            platforms = db.session.query(Tool.platform).distinct().all()
+            for platform in platforms:
+                cats = db.session.query(Tool.category).filter_by(platform=platform[0]).distinct().all()
+                categories[platform[0]] = [cat[0] for cat in cats]
+        return dict(tool_categories=categories)
+    
+    # ==================== INITIAL DATA ====================
+    
+    @app.before_first_request
+    def create_tables_and_seed():
+        """Create tables and seed initial data"""
+        db.create_all()
         
-        return jsonify({'success': True, 'tool': tool_name})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/api/user/profile', methods=['GET', 'PUT'])
-def user_profile():
-    """Get or update user profile"""
-    try:
-        if 'user' not in session:
-            return jsonify({'error': 'Not authenticated'}), 401
+        # Seed tools if empty
+        if Tool.query.count() == 0:
+            seed_tools()
+            print("✅ Tools database seeded!")
         
-        username = session['user']
+        print("✅ Database initialized!")
+    
+    def seed_tools():
+        """Seed initial tools from console prototype"""
+        tools_data = [
+            # Linux - Kali
+            ("Nmap", "Linux", "Information Gathering", "Kali Linux", 
+             "Network discovery and security auditing", "Beginner"),
+            ("Metasploit Framework", "Linux", "Exploitation Tools", "Kali Linux",
+             "Penetration testing platform", "Intermediate"),
+            ("Wireshark", "Linux", "Sniffing & Spoofing", "Kali Linux",
+             "Network protocol analyzer", "Beginner"),
+            ("Burp Suite", "Linux", "Web Application Analysis", "Kali Linux",
+             "Web vulnerability scanner", "Intermediate"),
+            ("John the Ripper", "Linux", "Password Attacks", "Kali Linux",
+             "Password cracker", "Intermediate"),
+            ("Aircrack-ng", "Linux", "Wireless Attacks", "Kali Linux",
+             "WiFi security auditing tools", "Intermediate"),
+            ("Ghidra", "Linux", "Reverse Engineering", "Kali Linux",
+             "Software reverse engineering suite", "Advanced"),
+            ("Autopsy", "Linux", "Forensics", "Kali Linux",
+             "Digital forensics platform", "Intermediate"),
+            
+            # Phone - Android
+            ("JADX", "Phone", "Reverse Engineering", "Android",
+             "Dex to Java decompiler", "Beginner"),
+            ("APKTool", "Phone", "Reverse Engineering", "Android",
+             "Reverse engineering APK files", "Intermediate"),
+            ("MobSF", "Phone", "Forensics", "Android",
+             "Mobile Security Framework", "Intermediate"),
+            
+            # Windows
+            ("IDA Pro", "Windows", "Reverse Engineering", "General",
+             "Interactive disassembler", "Advanced"),
+            ("x64dbg", "Windows", "Reverse Engineering", "General",
+             "Open-source debugger", "Intermediate"),
+            
+            # Web
+            ("Burp Suite Professional", "Web", "Bug Bounty", "General",
+             "Web vulnerability scanner", "Intermediate"),
+            ("OWASP ZAP", "Web", "Bug Bounty", "General",
+             "Web app security scanner", "Beginner"),
+            ("Sublist3r", "Web", "Reconnaissance", "General",
+             "Subdomain enumeration tool", "Beginner"),
+        ]
         
-        if request.method == 'GET':
-            user = USERS_DB.get(username, {
-                'username': username,
-                'anonymous': session.get('anonymous', False),
-                'experience': 'beginner',
-                'resources': [],
-                'followed_tools': []
-            })
-            return jsonify(user)
+        for name, platform, category, subcategory, description, difficulty in tools_data:
+            tool = Tool(
+                name=name,
+                platform=platform,
+                category=category,
+                subcategory=subcategory,
+                description=description,
+                difficulty=difficulty.lower(),
+                is_verified=True
+            )
+            db.session.add(tool)
         
-        elif request.method == 'PUT':
-            data = request.get_json()
-            if not data:
-                return jsonify({'error': 'No data provided'}), 400
-                
-            if username in USERS_DB:
-                # Update only allowed fields
-                allowed_fields = ['experience', 'resources']
-                for field in allowed_fields:
-                    if field in data:
-                        USERS_DB[username][field] = data[field]
-                return jsonify({'success': True, 'user': USERS_DB[username]})
-            return jsonify({'error': 'User not found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        db.session.commit()
+    
+    return app
 
-@app.route('/logout')
-def logout():
-    """Logout user"""
-    session.clear()
-    return redirect('/')
+# Create the app instance
+app = create_app()
 
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy', 
-        'timestamp': datetime.now().isoformat(),
-        'users': len(USERS_DB),
-        'tools': sum(
-            len(tool) 
-            for platform in TOOLS_DB.values() 
-            for category in platform.values() 
-            for subcategory in category.values() 
-            for tool in subcategory
-        )
-    })
-
-# ==================== ERROR HANDLERS ====================
-@app.errorhandler(404)
-def not_found(e):
-    """Handle 404 errors"""
-    if request.path.startswith('/api/'):
-        return jsonify({'error': 'Endpoint not found'}), 404
-    return render_template('404.html'), 404
-
-@app.errorhandler(500)
-def server_error(e):
-    """Handle 500 errors"""
-    if request.path.startswith('/api/'):
-        return jsonify({'error': 'Internal server error'}), 500
-    return render_template('500.html'), 500
-
-# ==================== FAVICON & ROBOTS ====================
-@app.route('/favicon.ico')
-def favicon():
-    return send_from_directory('static', 'favicon.ico', mimetype='image/vnd.microsoft.icon')
-
-@app.route('/robots.txt')
-def robots():
-    return send_from_directory('static', 'robots.txt', mimetype='text/plain')
-
-# ==================== LOCAL DEVELOPMENT ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"Starting Hacker Hub on port {port}")
-    print(f"Static folder: {app.static_folder}")
-    print(f"Template folder: {app.template_folder}")
     app.run(host='0.0.0.0', port=port, debug=True)
